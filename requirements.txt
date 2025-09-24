@@ -38,3 +38,11 @@ rembg
 onnxruntime
 #gevent
 #geventhttpclient
+
+smplx
+rtree
+pyglet<2
+nuscenes-devkit
+pyquaternion
+imageio[ffmpeg]
+git+https://github.com/mattloper/chumpy.git
