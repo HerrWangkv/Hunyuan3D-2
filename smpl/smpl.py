@@ -16,6 +16,12 @@ import logging
 import imageio.v2 as imageio
 from gsplat.rendering import rasterization
 from smpl.cam_utils import get_single_cam, get_default_cam_sequences
+from diffusers import (
+    ControlNetModel,
+    StableDiffusionXLControlNetPipeline,
+    StableDiffusionControlNetPipeline,
+    UniPCMultistepScheduler,
+)
 
 # -----------------------------------------------------
 # Helpers: normals, per-vertex & per-face Gaussians
@@ -312,8 +318,8 @@ def get_uv_color_from_texture(new_mesh, points):
         colors.append(color)
     return np.array(colors)
 
+
 class SMPL:
-    default_pose = np.load("smpl/B1 - stand to walk_poses.npz")["poses"][0, :66]
     paint_pipeline = Hunyuan3DPaintPipeline.from_pretrained(
         'tencent/Hunyuan3D-2',
         subfolder='hunyuan3d-paint-v2-0-turbo'
@@ -335,7 +341,6 @@ class SMPL:
             torch.zeros([1, 10], device=device) if betas is None else betas.to(device)
         )
         self.body_pose = torch.zeros([1, 69], device=device)  # 23*3 axis-angle
-        # self.body_pose[0, :63] = torch.from_numpy(self.default_pose[3:66]).to(device)
         with torch.no_grad():
             out = self.model(
                 betas=self.betas,
@@ -369,14 +374,14 @@ class SMPL:
             image_height=int(cam["image_height"]),
         )
         return openpose_img
-    
+
     def paint_mesh(self, ref_image: Image.Image):
         if ref_image.mode == 'RGB':
             rembg = BackgroundRemover()
             ref_image = rembg(ref_image)
 
         old_mesh = copy.deepcopy(self.mesh)
-        
+
         # Suppress all output (warnings, logging, prints)
         with warnings.catch_warnings():
             warnings.simplefilter("ignore")
@@ -394,7 +399,7 @@ class SMPL:
                     sys.stdout = old_stdout
                     sys.stderr = old_stderr
                     logging.disable(logging.NOTSET)  # Re-enable logging
-        
+
         colors = get_uv_color_from_texture(new_mesh, self.rest_vertices)
         self.mesh.visual.vertex_colors = colors.astype(np.uint8)
         self.colors = torch.from_numpy(colors / 255).to(self.device)
@@ -469,7 +474,7 @@ class SMPL:
             background = torch.ones(3, device=self.device)
         else:
             background = background.to(self.device)
-        
+
         width = int(cam_info["image_width"])
         height = int(cam_info["image_height"])
 
@@ -480,14 +485,14 @@ class SMPL:
         opacities = gs["opacities"]
         scales = gs["scales"]
         rotations = gs["rots"]
-        
+
         # Get camera matrices from cam_info
         c2w = torch.from_numpy(cam_info["c2w"]).to(self.device)
         w2c = torch.linalg.inv(c2w)  # world-to-camera
 
         # Convert to view matrix (gsplat expects camera-to-world, we have world-to-camera)
         viewmat = w2c.unsqueeze(0)  # [1, 4, 4]
-        
+
         # Create intrinsic matrix from projection matrix
         # For orthographic projection used in SMPL, we need to construct K matrix
         fovx = cam_info.get("FoVx", 1.0)
@@ -520,7 +525,7 @@ class SMPL:
             radius_clip=0.0,
             backgrounds=background.unsqueeze(0),
         )
-        
+
         # Clamp and return the rendered image
         rendered_image = torch.clamp(renders[0], 0.0, 1.0)
         return rendered_image
@@ -534,7 +539,7 @@ class SMPL:
             # Convert to numpy array for video writing
             frame = (rendered_img.cpu().numpy() * 255).astype(np.uint8)
             frames.append(frame)
-        
+
         # Save video using imageio
         imageio.mimsave(out_path, frames, fps=fps)
         print(f"Orbit video saved to {out_path}")
@@ -560,34 +565,35 @@ class SMPL:
             frames.append(frame)
         imageio.mimsave(out_path, frames, fps=fps)
         print(f"Visualization video saved to {out_path}")
-        
+
 
 if __name__ == "__main__":
     print("Testing SMPL with gsplat rendering...")
-    
+
     # Initialize SMPL model
-    smpl = SMPL("smpl/SMPL_NEUTRAL.pkl")
+    smpl = SMPL("smpl/SMPL_NEUTRAL.pkl", betas=torch.rand(1, 10))
     openpose_img = smpl.get_openpose_img(azimuth=180)
     Image.fromarray(openpose_img).save("smpl_openpose_test.png")
-    ref_image = Image.open("smpl/smpl_textured_female.png")
+    controlnet = ControlNetModel.from_pretrained(
+        "lllyasviel/sd-controlnet-openpose", torch_dtype=torch.float16
+    )
+
+    pipe = StableDiffusionControlNetPipeline.from_pretrained(
+        "runwayml/stable-diffusion-v1-5",
+        controlnet=controlnet,
+        safety_checker=None,
+        torch_dtype=torch.float16,
+    )
+    pipe.scheduler = UniPCMultistepScheduler.from_config(pipe.scheduler.config)
+    pipe.to("cuda")
+    ref_image = pipe(
+        prompt="A male real-world pedestrian, facing the camera, high quality, detailed",
+        negative_prompt="cartoon, blurry, drawing, sketch, toy-like",
+        num_inference_steps=20,
+        image=Image.fromarray(openpose_img),
+    ).images[0]
+    ref_image.save("smpl_ref_image.png")
     smpl.paint_mesh(ref_image)
-    # pose = np.load("smpl/Form 1_poses.npz")["poses"][:, :66]
-    # global_orient = torch.zeros([1, 3], device="cuda")  # global_orient
-    # global_orient[0] = torch.from_numpy(
-    #     pose[1234, :3]
-    # ).to("cuda")
-    # initial_pose = torch.zeros([1, 69], device="cuda")  # 23*3 axis-angle
-    # initial_pose[0, :63] = torch.from_numpy(
-    #     pose[1234, 3:66]
-    # ).to("cuda")
-    # smpl.apply_pose(
-    #     body_pose=initial_pose, global_orient=global_orient
-    # )
-    
-    # # Test gsplat rendering
-    # print("Testing gsplat render...")
-    # smpl.render()
-    
+
     smpl.orbit_video("smpl_orbit_test.mp4", fps=30)
     smpl.visualize("smpl/Form 1_poses.npz", out_path="smpl_visualization_test.mp4", fps=120)
-
