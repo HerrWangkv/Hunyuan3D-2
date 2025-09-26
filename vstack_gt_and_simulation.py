@@ -84,14 +84,14 @@ def vstack_videos(video_path1, video_path2, output_path):
 
 def parse_args():
     parser = argparse.ArgumentParser(description="Vertically stack gt and simulation videos.")
-    parser.add_argument("--dir", type=str, default="videos")
+    parser.add_argument("--dir", type=str, default="val_videos")
     return parser.parse_args()
 
 def main():
     args = parse_args()
     for scene_idx in os.listdir(args.dir):
         video_path1 = f"{args.dir}/{scene_idx}/gt_video.mp4"
-        video_path2 = f"{args.dir}/{scene_idx}/objects.mp4"
+        video_path2 = f"{args.dir}/{scene_idx}/rgbs.mp4"
         output_path = f"{args.dir}/{scene_idx}/vstacked_video.mp4"
         vstack_videos(video_path1, video_path2, output_path)
 
