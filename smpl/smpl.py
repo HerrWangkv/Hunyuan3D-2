@@ -587,22 +587,28 @@ if __name__ == "__main__":
         "lllyasviel/sd-controlnet-openpose", torch_dtype=torch.float16
     )
 
-    pipe = StableDiffusionControlNetPipeline.from_pretrained(
+    openpose_pipeline = StableDiffusionControlNetPipeline.from_pretrained(
         "runwayml/stable-diffusion-v1-5",
         controlnet=controlnet,
         safety_checker=None,
         torch_dtype=torch.float16,
     )
-    pipe.scheduler = UniPCMultistepScheduler.from_config(pipe.scheduler.config)
-    pipe.to("cuda")
-    ref_image = pipe(
+    openpose_pipeline.scheduler = UniPCMultistepScheduler.from_config(
+        openpose_pipeline.scheduler.config
+    )
+    openpose_pipeline.to("cuda")
+    ref_image = openpose_pipeline(
         prompt="A male real-world pedestrian, facing the camera, high quality, detailed",
         negative_prompt="cartoon, blurry, drawing, sketch, toy-like",
         num_inference_steps=20,
         image=Image.fromarray(openpose_img),
     ).images[0]
     ref_image.save("smpl_ref_image.png")
-    smpl.paint_mesh(ref_image)
+
+    paint_pipeline = Hunyuan3DPaintPipeline.from_pretrained(
+        "tencent/Hunyuan3D-2", subfolder="hunyuan3d-paint-v2-0-turbo"
+    )
+    smpl.paint_mesh(ref_image, paint_pipeline)
 
     smpl.orbit_video("smpl_orbit_test.mp4", fps=30)
     smpl.visualize("smpl/Form 1_poses.npz", out_path="smpl_visualization_test.mp4", fps=120)
