@@ -2,6 +2,7 @@ import os
 import cv2
 import numpy as np
 from nuscenes.nuscenes import NuScenes
+from nuscenes.utils import splits
 import matplotlib.pyplot as plt
 import glob
 import imageio.v2 as imageio
@@ -36,42 +37,41 @@ def save_img(nusc, sample, save_path):
         x_offset += img.size[0]
     final_img.save(save_path)
 
-def parse_args():
-    parser = argparse.ArgumentParser(description="Render 3D objects in a scene.")
-    parser.add_argument("--scene-idx", type=int, default=0, help="Index of the scene to render.")
-    return parser.parse_args()
-
 def main():
     # Initialize NuScenes dataset
-    nusc = NuScenes(version="v1.0-mini", dataroot="/data/nuscenes", verbose=True)
+    nusc = NuScenes(version="v1.0-trainval", dataroot="/data/nuscenes", verbose=True)
+    val_scenes = [s for s in nusc.scene if s["name"] in splits.val]
+    # Get scenes in validation set
+    for scene_idx, scene in enumerate(val_scenes):
+        print(f"Scene index: {scene_idx}, Scene name: {scene['name']}")
+        first_sample_token = scene["first_sample_token"]
+        sample = nusc.get("sample", first_sample_token)
+        t = 0
+        os.makedirs(f"val_videos/{scene_idx}/gt_images", exist_ok=True)
+        while sample:
+            save_img(
+                nusc, sample, f"val_videos/{scene_idx}/gt_images/frame_{t:04d}.png"
+            )
 
-    # Get scene
-    args = parse_args()
-    scene = nusc.scene[args.scene_idx]
-    first_sample_token = scene['first_sample_token']
-    sample = nusc.get('sample', first_sample_token)
-    t = 0
-    os.makedirs(f"videos/{args.scene_idx}/gt_images", exist_ok=True)
-    while sample:
-        save_img(nusc, sample, f"videos/{args.scene_idx}/gt_images/frame_{t:04d}.png")
+            # Move to the next sample
+            if sample["next"] == "":
+                break
+            sample = nusc.get("sample", sample["next"])
+            t += 1
 
-        # Move to the next sample
-        if sample['next'] == '':
-            break
-        sample = nusc.get('sample', sample['next'])
-        t += 1
+        # Generate a video from the saved frames
+        frame_paths = sorted(glob.glob(f"val_videos/{scene_idx}/gt_images/frame_*.png"))
+        with imageio.get_writer(
+            f"val_videos/{scene_idx}/gt_video.mp4", fps=2
+        ) as video_writer:
+            for frame_path in frame_paths:
+                frame = imageio.imread(frame_path)
+                video_writer.append_data(frame)
 
-    # Generate a video from the saved frames
-    frame_paths = sorted(glob.glob(f"videos/{args.scene_idx}/gt_images/frame_*.png"))
-    with imageio.get_writer(f'videos/{args.scene_idx}/gt_video.mp4', fps=2) as video_writer:
+        # Clean up the frame images and remove the folder
         for frame_path in frame_paths:
-            frame = imageio.imread(frame_path)
-            video_writer.append_data(frame)
-
-    # Clean up the frame images and remove the folder
-    for frame_path in frame_paths:
-        os.remove(frame_path)
-    os.rmdir(f"videos/{args.scene_idx}/gt_images")
+            os.remove(frame_path)
+        os.rmdir(f"val_videos/{scene_idx}/gt_images")
 
 if __name__ == "__main__":
     main()

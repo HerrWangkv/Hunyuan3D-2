@@ -320,10 +320,7 @@ def get_uv_color_from_texture(new_mesh, points):
 
 
 class SMPL:
-    paint_pipeline = Hunyuan3DPaintPipeline.from_pretrained(
-        'tencent/Hunyuan3D-2',
-        subfolder='hunyuan3d-paint-v2-0-turbo'
-    )
+
     def __init__(
         self,
         model_path,
@@ -331,6 +328,7 @@ class SMPL:
         device="cuda",
     ):
         self.device = device
+
         self.model = smplx.create(
             model_path,
             model_type="smpl",
@@ -349,11 +347,16 @@ class SMPL:
             )
         # better for Hunyuan3DPaint
         self.rest_vertices = out.vertices[0].detach().cpu().numpy()  # (6890, 3)
-        global_orient = torch.tensor([[math.pi / 2, 0.0, 0.0]], device=device)  # stand up
+
+        # Store global orientation as instance variable
+        self.global_orient = torch.tensor(
+            [[math.pi / 2, 0.0, 0.0]], device=device
+        )  # stand up
+
         out = self.model(
             betas=self.betas,
             body_pose=self.body_pose,
-            global_orient=global_orient,
+            global_orient=self.global_orient,
             return_verts=True,
             return_joints=True,
         )
@@ -375,7 +378,13 @@ class SMPL:
         )
         return openpose_img
 
-    def paint_mesh(self, ref_image: Image.Image):
+    def paint_mesh(self, ref_image: Image.Image, paint_pipeline):
+        """Paint the mesh with a reference image using the provided paint pipeline.
+
+        Args:
+            ref_image: Reference image to use for texturing
+            paint_pipeline: Hunyuan3D paint pipeline instance. If None, will get one for current device.
+        """
         if ref_image.mode == 'RGB':
             rembg = BackgroundRemover()
             ref_image = rembg(ref_image)
@@ -394,7 +403,7 @@ class SMPL:
                 try:
                     sys.stdout = devnull
                     sys.stderr = devnull
-                    new_mesh = self.paint_pipeline(old_mesh, ref_image)
+                    new_mesh = paint_pipeline(old_mesh, ref_image)
                 finally:
                     sys.stdout = old_stdout
                     sys.stderr = old_stderr
