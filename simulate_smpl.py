@@ -738,7 +738,10 @@ def interpolate_transform_matrix(
 def parse_args():
     parser = argparse.ArgumentParser(description="Render 3D objects in a scene.")
     parser.add_argument(
-        "--smpl-lora", type=str, default="lora_ckpts/smpl.pt", help="Path to the smpl LoRA model."
+        "--save-splats", action="store_true", help="Whether to save splat files."
+    )
+    parser.add_argument(
+        "--scene-idx", type=int, default=None, help="Index of the scene to process."
     )
     parser.add_argument(
         "--seed", type=int, default=42, help="Random seed for reproducibility."
@@ -806,6 +809,13 @@ def main_worker(rank, world_size, args):
             version="v1.0-trainval", dataroot="/data/nuscenes", verbose=False
         )
     val_scenes = [s for s in nusc.scene if s["name"] in splits.val]
+    if args.scene_idx is not None:
+        if isinstance(args.scene_idx, int):
+            args.scene_idx = [args.scene_idx]
+        assert isinstance(
+            args.scene_idx, list
+        ), "scene_idx should be a list of integers"
+        val_scenes = [val_scenes[idx] for idx in args.scene_idx]
     for scene_idx, scene in enumerate(val_scenes):
         sample = None
         objects = {}
@@ -973,7 +983,9 @@ def main_worker(rank, world_size, args):
         )
 
         if rank == 0:
-            print(f"Created {len(created_humans)} human objects for scene {scene_idx}")
+            print(
+                f"Created {len(created_humans)} human objects for scene {scene_idx if args.scene_idx is None else args.scene_idx[scene_idx]}"
+            )
 
         # Store created objects by their instance tokens
         # Each rank only keeps its local objects - no more placeholder objects
@@ -1034,8 +1046,14 @@ def main_worker(rank, world_size, args):
             print(f"Single GPU: Rendering all {total_frames} frames")
 
         # Create output directory
-        os.makedirs(f"val_videos/{scene_idx}/rendered_images", exist_ok=True)
-        os.makedirs(f"val_videos/{scene_idx}/rendered_masks", exist_ok=True)
+        os.makedirs(
+            f"val_videos_{args.hz}hz/{scene_idx if args.scene_idx is None else args.scene_idx[scene_idx]}/rendered_images",
+            exist_ok=True,
+        )
+        os.makedirs(
+            f"val_videos_{args.hz}hz/{scene_idx if args.scene_idx is None else args.scene_idx[scene_idx]}/rendered_masks",
+            exist_ok=True,
+        )
 
         # Render assigned frames
         # Render assigned frames - each rank renders its subset
@@ -1060,9 +1078,19 @@ def main_worker(rank, world_size, args):
             else:
                 gs = None
 
+            # Save splats if requested
+            if args.save_splats and gs is not None:
+                os.makedirs(
+                    f"val_videos_{args.hz}hz/{scene_idx if args.scene_idx is None else args.scene_idx[scene_idx]}/splats",
+                    exist_ok=True,
+                )
+                splat_path = f"val_videos_{args.hz}hz/{scene_idx if args.scene_idx is None else args.scene_idx[scene_idx]}/splats/frame_{t:04d}.pt"
+                torch.save(gs, splat_path)
+
             # Save the rendered image for the current frame
-            image_path = f"val_videos/{scene_idx}/rendered_images/frame_{t:04d}.png"
-            mask_path = f"val_videos/{scene_idx}/rendered_masks/frame_{t:04d}.png"
+            image_path = f"val_videos_{args.hz}hz/{scene_idx if args.scene_idx is None else args.scene_idx[scene_idx]}/rendered_images/frame_{t:04d}.png"
+            mask_path = f"val_videos_{args.hz}hz/{scene_idx if args.scene_idx is None else args.scene_idx[scene_idx]}/rendered_masks/frame_{t:04d}.png"
+
             render(
                 gs,
                 intrinsics,
@@ -1081,10 +1109,14 @@ def main_worker(rank, world_size, args):
         if rank == 0:
             print(f"Assembling video from all {total_frames} frames...")
             frame_paths = sorted(
-                glob.glob(f"val_videos/{scene_idx}/rendered_images/frame_*.png")
+                glob.glob(
+                    f"val_videos_{args.hz}hz/{scene_idx if args.scene_idx is None else args.scene_idx[scene_idx]}/rendered_images/frame_*.png"
+                )
             )
             mask_paths = sorted(
-                glob.glob(f"val_videos/{scene_idx}/rendered_masks/frame_*.png")
+                glob.glob(
+                    f"val_videos_{args.hz}hz/{scene_idx if args.scene_idx is None else args.scene_idx[scene_idx]}/rendered_masks/frame_*.png"
+                )
             )
 
             # Check that all frames were rendered
@@ -1098,7 +1130,7 @@ def main_worker(rank, world_size, args):
                 )
 
             with imageio.get_writer(
-                f"val_videos/{scene_idx}/rgbs.mp4",
+                f"val_videos_{args.hz}hz/{scene_idx if args.scene_idx is None else args.scene_idx[scene_idx]}/rgbs.mp4",
                 mode="I",
                 fps=args.hz,
                 format="FFMPEG",
@@ -1110,10 +1142,14 @@ def main_worker(rank, world_size, args):
             # Clean up the frame images and remove the folder
             for frame_path in frame_paths:
                 os.remove(frame_path)
-            os.rmdir(f"val_videos/{scene_idx}/rendered_images")
-            print(f"✓ Video saved: val_videos/{scene_idx}/rgbs.mp4")
+            os.rmdir(
+                f"val_videos_{args.hz}hz/{scene_idx if args.scene_idx is None else args.scene_idx[scene_idx]}/rendered_images"
+            )
+            print(
+                f"✓ Video saved: val_videos_{args.hz}hz/{scene_idx if args.scene_idx is None else args.scene_idx[scene_idx]}/rgbs.mp4"
+            )
             with imageio.get_writer(
-                f"val_videos/{scene_idx}/masks.mp4",
+                f"val_videos_{args.hz}hz/{scene_idx if args.scene_idx is None else args.scene_idx[scene_idx]}/masks.mp4",
                 mode="I",
                 fps=args.hz,
                 format="FFMPEG",
@@ -1124,8 +1160,21 @@ def main_worker(rank, world_size, args):
             # Clean up the mask images and remove the folder
             for mask_path in mask_paths:
                 os.remove(mask_path)
-            os.rmdir(f"val_videos/{scene_idx}/rendered_masks")
-            print(f"✓ Mask video saved: val_videos/{scene_idx}/masks.mp4")
+            os.rmdir(
+                f"val_videos_{args.hz}hz/{scene_idx if args.scene_idx is None else args.scene_idx[scene_idx]}/rendered_masks"
+            )
+            print(
+                f"✓ Mask video saved: val_videos_{args.hz}hz/{scene_idx if args.scene_idx is None else args.scene_idx[scene_idx]}/masks.mp4"
+            )
+
+            # Report splat files if they were saved
+            if args.save_splats:
+                splat_files = glob.glob(
+                    f"val_videos_{args.hz}hz/{scene_idx if args.scene_idx is None else args.scene_idx[scene_idx]}/splats/frame_*.pt"
+                )
+                print(
+                    f"✓ Splat files saved: {len(splat_files)} files in val_videos_{args.hz}hz/{scene_idx if args.scene_idx is None else args.scene_idx[scene_idx]}/splats/"
+                )
 
         # Synchronize all processes after video assembly
         if distributed_success and world_size > 1 and dist.is_initialized():
