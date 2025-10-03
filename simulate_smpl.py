@@ -397,6 +397,90 @@ def create_humans_batched(
         return local_created_objects
 
 
+def orthogonalize_rotation_matrix(matrix):
+    """
+    Orthogonalize a 3x3 matrix using SVD decomposition to ensure it's a valid rotation matrix.
+    """
+    if isinstance(matrix, torch.Tensor):
+        matrix_np = matrix.cpu().numpy()
+    else:
+        matrix_np = matrix
+
+    # Use SVD to orthogonalize the matrix
+    U, _, Vt = np.linalg.svd(matrix_np)
+
+    # Ensure proper rotation (determinant = 1)
+    R = U @ Vt
+    if np.linalg.det(R) < 0:
+        U[:, -1] *= -1
+        R = U @ Vt
+
+    return R
+
+
+def rotate_gs(rotation_matrix, gs):
+    """
+    Args:
+        rotation_matrix: 3x3 rotation matrix
+        gs: gaussian splats
+    """
+    # Ensure rotation_matrix is a tensor on the same device as gs["xyz"]
+    if not isinstance(rotation_matrix, torch.Tensor):
+        rotation_matrix = torch.tensor(
+            rotation_matrix, device=gs["xyz"].device, dtype=torch.float64
+        )
+    else:
+        rotation_matrix = rotation_matrix.to(
+            device=gs["xyz"].device, dtype=torch.float64
+        )
+
+    rotated_xyz = gs["xyz"].double() @ rotation_matrix.T
+
+    # Orthogonalize the rotation matrix before creating quaternion
+    orthogonal_matrix = orthogonalize_rotation_matrix(rotation_matrix)
+
+    rotated_rotations = F.normalize(
+        quat_multiply(
+            torch.tensor(Quaternion(matrix=orthogonal_matrix).elements).to(
+                device=gs["rots"].device
+            ),
+            gs["rots"],
+        )
+    )
+    gs["xyz"] = rotated_xyz.to(torch.float32)
+    gs["rots"] = rotated_rotations.to(torch.float32)
+    return gs
+
+
+def translate_gs(translation, gs):
+    """
+    Args:
+        translation: 3 translation vector
+        gs: gaussian splats
+    """
+    # Ensure translation is a tensor on the same device as gs["xyz"]
+    if not isinstance(translation, torch.Tensor):
+        translation = torch.tensor(
+            translation, device=gs["xyz"].device, dtype=gs["xyz"].dtype
+        )
+    else:
+        translation = translation.to(device=gs["xyz"].device, dtype=gs["xyz"].dtype)
+
+    gs["xyz"] += translation
+    return gs
+
+
+def transform_gs(transformation_matrix, gs):
+    """
+    Args:
+        transformation_matrix: 4x4 transformation matrix
+        gs: gaussian splats
+    """
+    gs = rotate_gs(transformation_matrix[:3, :3], gs)
+    gs = translate_gs(transformation_matrix[:3, 3], gs)
+    return gs
+
+
 class Object3D:
     poses = {
         "stand_female": np.load("smpl/A1 - Stand_poses.npz")["poses"][
@@ -496,13 +580,13 @@ class Object3D:
             "sway_female",
             "sway_male",
         ]:
-            gs = self.rotate_gs(rpy2rotations(0, 0, -np.pi / 2, self.device), gs)
+            gs = rotate_gs(rpy2rotations(0, 0, -np.pi / 2, self.device), gs)
         elif self._pose_key == "walk":
-            gs = self.rotate_gs(rpy2rotations(0, 0, 3 * np.pi / 4, self.device), gs)
+            gs = rotate_gs(rpy2rotations(0, 0, 3 * np.pi / 4, self.device), gs)
         elif self._pose_key == "jog":
-            gs = self.rotate_gs(rpy2rotations(0, 0, -5 * np.pi / 6, self.device), gs)
+            gs = rotate_gs(rpy2rotations(0, 0, -5 * np.pi / 6, self.device), gs)
         elif self._pose_key == "run":
-            gs = self.rotate_gs(rpy2rotations(0, 0, -3 * np.pi / 4, self.device), gs)
+            gs = rotate_gs(rpy2rotations(0, 0, -3 * np.pi / 4, self.device), gs)
         valid_mask = gs["opacities"].squeeze() != 0
         x_min, x_max = gs["xyz"][valid_mask, 0].min(), gs["xyz"][valid_mask, 0].max()
         y_min, y_max = gs["xyz"][valid_mask, 1].min(), gs["xyz"][valid_mask, 1].max()
@@ -541,30 +625,7 @@ class Object3D:
         '''
         self.apply_pose(delta_t=delta_t)
         gs = deepcopy(self._centeralized_and_scaled_gs)
-        gs = self.rotate_gs(transformation_matrix[:3, :3], gs)
-        gs = self.translate_gs(transformation_matrix[:3, 3], gs)
-        return gs
-
-    def rotate_gs(self, rotation_matrix, gs):
-        '''
-        Args:
-            rotation_matrix: 3x3 rotation matrix
-        '''
-        rotated_xyz = gs['xyz'].double() @ rotation_matrix.T
-        rotated_rotations = F.normalize(quat_multiply(
-            torch.tensor(Quaternion(matrix=rotation_matrix.cpu().numpy()).elements).cuda(),
-            gs['rots'],
-        ))
-        gs['xyz'] = rotated_xyz.to(torch.float32)
-        gs['rots'] = rotated_rotations.to(torch.float32)
-        return gs
-
-    def translate_gs(self, translation, gs):
-        '''
-        Args:
-            translation: 3 translation vector
-        '''
-        gs['xyz'] += translation
+        gs = transform_gs(transformation_matrix, gs)
         return gs
 
 def get_obj_to_cam_front(rotation, translation, cam_front_to_world):
@@ -832,6 +893,8 @@ def main_worker(rank, world_size, args):
         existing_humans = []
         annotations_2hz = {}
         positions = {}
+        current_to_initial_cam_front_2hz = {}
+        initial_cam_front_to_world = None
 
         for t in range(scene["nbr_samples"]):
             sample_token = (
@@ -862,6 +925,11 @@ def main_worker(rank, world_size, args):
             ego_to_world[:3, :3] = Quaternion(ego_pose["rotation"]).rotation_matrix
             ego_to_world[:3, 3] = ego_pose["translation"]
             cam_front_to_world = ego_to_world @ cam_front_to_ego
+            if initial_cam_front_to_world is None:
+                initial_cam_front_to_world = cam_front_to_world
+            current_to_initial_cam_front_2hz[t] = (
+                np.linalg.inv(initial_cam_front_to_world) @ cam_front_to_world
+            )
             for _, ann_token in enumerate(sample["anns"]):
                 ann = nusc.get("sample_annotation", ann_token)
                 if not ann["category_name"].startswith("human."):
@@ -915,6 +983,7 @@ def main_worker(rank, world_size, args):
         # Create interpolated annotations with higher frame rate
         interpolation_factor = args.hz // 2  # Convert from 2Hz to desired Hz
         annotations_required = {}
+        current_to_initial_cam_front_required = {}
 
         for inst_token in annotations_2hz:
             annotations_required[inst_token] = {}
@@ -970,6 +1039,48 @@ def main_worker(rank, world_size, args):
                 if obj["inst_token"] == inst_token:
                     obj["pose_key"] = pose_key
                     break
+
+        # Interpolate camera front to world matrices for higher frame rate
+        time_keys = sorted(current_to_initial_cam_front_2hz.keys())
+        for i in range(len(time_keys) - 1):
+            t1, t2 = time_keys[i], time_keys[i + 1]
+            cam_mat1 = torch.tensor(
+                current_to_initial_cam_front_2hz[t1], dtype=torch.float32
+            )
+            cam_mat2 = torch.tensor(
+                current_to_initial_cam_front_2hz[t2], dtype=torch.float32
+            )
+
+            # Add the first keyframe and interpolated frames
+            for interp_step in range(interpolation_factor):
+                interp_t = t1 * interpolation_factor + interp_step
+                if interp_step == 0:
+                    # Use exact keyframe
+                    current_to_initial_cam_front_required[interp_t] = (
+                        current_to_initial_cam_front_2hz[t1]
+                    )
+                else:
+                    # Interpolate
+                    alpha = interp_step / interpolation_factor
+                    interp_cam_mat = interpolate_transform_matrix(
+                        cam_mat1, cam_mat2, alpha
+                    )
+                    current_to_initial_cam_front_required[interp_t] = (
+                        interp_cam_mat.numpy()
+                    )
+
+        # Add the last keyframe
+        if time_keys:
+            last_t = time_keys[-1]
+            for interp_step in range(interpolation_factor):
+                interp_t = last_t * interpolation_factor + interp_step
+                current_to_initial_cam_front_required[interp_t] = (
+                    current_to_initial_cam_front_2hz[last_t]
+                )
+
+        del annotations_2hz
+        del positions
+        del current_to_initial_cam_front_2hz
 
         # Create humans using distributed processing
         effective_world_size = world_size if distributed_success else 1
@@ -1080,12 +1191,16 @@ def main_worker(rank, world_size, args):
 
             # Save splats if requested
             if args.save_splats and gs is not None:
+                current_to_initial_cam_front = current_to_initial_cam_front_required[t]
+                gs_in_initial_cam_front = transform_gs(
+                    current_to_initial_cam_front, deepcopy(gs)
+                )
                 os.makedirs(
                     f"val_videos_{args.hz}hz/{scene_idx if args.scene_idx is None else args.scene_idx[scene_idx]}/splats",
                     exist_ok=True,
                 )
                 splat_path = f"val_videos_{args.hz}hz/{scene_idx if args.scene_idx is None else args.scene_idx[scene_idx]}/splats/frame_{t:04d}.pt"
-                torch.save(gs, splat_path)
+                torch.save(gs_in_initial_cam_front, splat_path)
 
             # Save the rendered image for the current frame
             image_path = f"val_videos_{args.hz}hz/{scene_idx if args.scene_idx is None else args.scene_idx[scene_idx]}/rendered_images/frame_{t:04d}.png"
