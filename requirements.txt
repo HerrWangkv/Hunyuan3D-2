@@ -46,3 +46,5 @@ nuscenes-devkit
 pyquaternion
 imageio[ffmpeg]
 git+https://github.com/mattloper/chumpy.git
+timm
+wandb

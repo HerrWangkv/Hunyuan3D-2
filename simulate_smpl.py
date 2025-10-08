@@ -24,6 +24,285 @@ from smpl.smpl import SMPL
 from hy3dgen.texgen import Hunyuan3DPaintPipeline
 
 
+def initialize_unidepth_model(device="cuda", version="v2", backbone="vitl14"):
+    """Initialize UniDepth model using torch.hub."""
+    try:
+        print(f"Loading UniDepth {version} with backbone {backbone}...")
+        model = torch.hub.load(
+            "HerrWangkv/UniDepth", 
+            "UniDepth", 
+            version=version,
+            backbone=backbone, 
+            pretrained=True, 
+            trust_repo=True,
+            force_reload=False  # Set to True for debugging if needed
+        )
+        model = model.to(device)
+        model.eval()
+        print(f"✓ UniDepth {version} model loaded successfully")
+        return model
+    except Exception as e:
+        print(f"Failed to load UniDepth model: {e}")
+        print("Continuing without background depth estimation")
+        return None
+
+
+def images_to_point_clouds_batched(rgb_images, depth_maps, intrinsics_list, cam_to_front_transforms=None, device="cuda"):
+    """Convert batched RGB images and depth maps to point clouds (Gaussian splats format).
+    Optimized for processing 6 cameras simultaneously.
+    
+    Args:
+        rgb_images: [6, 3, H, W] RGB image tensors for 6 cameras
+        depth_maps: [6, H, W] depth map tensors for 6 cameras  
+        intrinsics_list: list of [3, 3] camera intrinsic matrices for 6 cameras
+        cam_to_front_transforms: list of [4, 4] transformation matrices from each camera to front camera frame
+        device: device to use
+    
+    Returns:
+        list: List of 6 point cloud dicts in Gaussian splats format (all in front camera frame)
+    """
+    num_cams, C, H, W = rgb_images.shape
+    point_clouds = []
+    
+    # Pre-compute pixel coordinates (shared across cameras)
+    u, v = torch.meshgrid(torch.arange(W, device=device), torch.arange(H, device=device), indexing='xy')
+    
+    # Process all cameras in parallel where possible
+    all_xyz = []
+    all_rgbs = []
+    all_valid_counts = []
+    
+    for cam_idx in range(num_cams):
+        rgb_image = rgb_images[cam_idx]  # [3, H, W]
+        depth_map = depth_maps[cam_idx]  # [H, W]
+        
+        # Handle case where depth map has extra dimensions
+        if depth_map.dim() > 2:
+            depth_map = depth_map.squeeze()  # Remove any extra dimensions
+            
+        intrinsics = intrinsics_list[cam_idx]  # [3, 3]
+        intrinsics[0] *= W
+        intrinsics[1] *= H
+        
+        # Convert to camera coordinates
+        fx, fy = intrinsics[0, 0], intrinsics[1, 1]
+        cx, cy = intrinsics[0, 2], intrinsics[1, 2]
+        
+        # Back-project to 3D
+        x = (u - cx) * depth_map / fx
+        y = (v - cy) * depth_map / fy
+        z = depth_map
+        
+        # Filter valid depths (no upper limit for autonomous driving)
+        valid_mask = (depth_map > 0)
+        valid_count = valid_mask.sum().item()
+        all_valid_counts.append(valid_count)
+        
+        if valid_count > 0:
+            # Stack to get 3D points [N, 3]
+            xyz = torch.stack([x[valid_mask], y[valid_mask], z[valid_mask]], dim=1)
+            
+            # Get corresponding RGB values [N, 3]
+            rgbs = rgb_image.permute(1, 2, 0)[valid_mask]  # [H, W, 3] -> [N, 3]
+            
+            all_xyz.append(xyz)
+            all_rgbs.append(rgbs)
+        else:
+            all_xyz.append(torch.empty(0, 3, device=device))
+            all_rgbs.append(torch.empty(0, 3, device=device))
+    
+    # Create Gaussian splat properties for each camera
+    for cam_idx in range(num_cams):
+        N = all_valid_counts[cam_idx]
+        
+        if N > 0:
+            xyz = all_xyz[cam_idx]
+            rgbs = all_rgbs[cam_idx]
+            
+            # Transform points to camera front frame if transforms are provided
+            if cam_to_front_transforms is not None:
+                transform = cam_to_front_transforms[cam_idx]
+                if not isinstance(transform, torch.Tensor):
+                    transform = torch.tensor(transform, device=device, dtype=torch.float32)
+                
+                # Apply transformation to 3D points
+                # Convert to homogeneous coordinates
+                xyz_homogeneous = torch.cat([xyz, torch.ones(N, 1, device=device)], dim=1)  # [N, 4]
+                
+                # Apply transformation
+                xyz_transformed = (transform @ xyz_homogeneous.T).T  # [N, 4]
+                xyz = xyz_transformed[:, :3]  # Back to [N, 3]
+            
+            # Create basic Gaussian splat properties
+            opacities = torch.ones(N, 1, device=device)  # Fully opaque background
+            
+            # Equal scale for all points
+            scales = torch.ones(N, 3, device=device) * 0.01  # Fixed scale for all background points
+            
+            # Identity rotations (quaternions: w, x, y, z)
+            rots = torch.zeros(N, 4, device=device)
+            rots[:, 0] = 1.0  # w = 1, x = y = z = 0
+            
+            point_cloud = {
+                "xyz": xyz,
+                "rgbs": rgbs,
+                "opacities": opacities,
+                "scales": scales,
+                "rots": rots
+            }
+        else:
+            # Empty point cloud
+            point_cloud = {
+                "xyz": torch.empty(0, 3, device=device),
+                "rgbs": torch.empty(0, 3, device=device),
+                "opacities": torch.empty(0, 1, device=device),
+                "scales": torch.empty(0, 3, device=device),
+                "rots": torch.empty(0, 4, device=device)
+            }
+        
+        point_clouds.append(point_cloud)
+    
+    return point_clouds
+
+
+def process_background_frame_with_depth(background_tensor, frame_idx, intrinsics, extrinsics, unidepth_model, device="cuda"):
+    """Process a single background frame with depth estimation to create point clouds.
+    Uses batched processing for all 6 cameras simultaneously for better performance.
+    All point clouds are transformed to the camera front frame.
+    
+    Args:
+        background_tensor: [T, 6, 3, H, W] background frames
+        frame_idx: int, index of the frame to process
+        intrinsics: dict of camera intrinsics for each camera
+        extrinsics: dict of camera extrinsics (camera to front frame transforms)
+        unidepth_model: UniDepth model
+        device: device to use
+    
+    Returns:
+        list: List of 6 background point clouds for the specified frame (all in front camera frame)
+    """
+    if unidepth_model is None:
+        print("UniDepth model not available, skipping background depth processing")
+        return None
+    
+    if frame_idx >= background_tensor.shape[0]:
+        print(f"Frame index {frame_idx} out of range (max: {background_tensor.shape[0]-1})")
+        return None
+    
+    T, num_cams, C, H, W = background_tensor.shape
+    cams = ['CAM_FRONT_LEFT', 'CAM_FRONT', 'CAM_FRONT_RIGHT', 'CAM_BACK_LEFT', 'CAM_BACK', 'CAM_BACK_RIGHT']
+    
+    # Pre-compute intrinsics tensors and camera transforms for batched processing
+    intrinsics_tensors = []
+    cam_to_front_transforms = []
+    for cam_name in cams:
+        K = torch.tensor(intrinsics[cam_name], device=device, dtype=torch.float32)
+        intrinsics_tensors.append(K)
+        
+        # Get camera to front frame transformation
+        cam_to_front = torch.tensor(extrinsics[cam_name], device=device, dtype=torch.float32)
+        cam_to_front_transforms.append(cam_to_front)
+    
+    with torch.no_grad():
+        # Get all 6 camera frames for this time step: [6, 3, H, W]
+        rgb_frames = background_tensor[frame_idx].to(device)
+        
+        # Batch process depth estimation for all 6 cameras
+        # UniDepth expects [B, 3, H, W] where B is batch size
+        predictions = unidepth_model.infer(rgb_frames)
+        depth_maps = predictions["depth"]  # [6, H, W] or [6, 1, H, W]
+        
+        # Handle case where depth maps have an extra dimension
+        if depth_maps.dim() == 4 and depth_maps.shape[1] == 1:
+            depth_maps = depth_maps.squeeze(1)  # [6, 1, H, W] -> [6, H, W]
+        
+        # Convert all 6 cameras to point clouds in one batched call
+        frame_point_clouds = images_to_point_clouds_batched(
+            rgb_frames, depth_maps, intrinsics_tensors, cam_to_front_transforms, device
+        )
+        
+        return frame_point_clouds
+
+def load_background_video(background_path, target_fps=None):
+    """Load background video and extract frames, split into 6 camera views.
+    
+    Returns:
+        torch.Tensor: Shape [T, 6, 3, H, W] where each frame is split into 6 camera views
+                     arranged in 2 rows × 3 columns
+    """
+    if not os.path.exists(background_path):
+        raise FileNotFoundError(f"Background video not found: {background_path}")
+    
+    # Read the video
+    video_reader = imageio.get_reader(background_path)
+    video_fps = video_reader.get_meta_data()['fps']
+    background_frames = []
+    
+    try:
+        for frame in video_reader:
+            background_frames.append(frame)
+    except Exception as e:
+        print(f"Warning: Error reading some frames from background video: {e}")
+    finally:
+        video_reader.close()
+    
+    print(f"Loaded background video: {len(background_frames)} frames at {video_fps} fps")
+    
+    # If we need to match a specific fps, resample frames
+    if target_fps is not None and target_fps != video_fps:
+        # Calculate the new number of frames based on target fps
+        duration = len(background_frames) / video_fps  # Duration in seconds
+        target_total_frames = int(duration * target_fps)
+        
+        # Resample frames to match target fps
+        indices = np.linspace(0, len(background_frames) - 1, target_total_frames).astype(int)
+        background_frames = [background_frames[i] for i in indices]
+        print(f"Resampled background video from {video_fps} fps to {target_fps} fps ({target_total_frames} frames)")
+    
+    # Convert to tensor and split into 6 camera views
+    T = len(background_frames)
+    if T == 0:
+        return torch.empty(0, 6, 3, 0, 0)
+    
+    # Get frame dimensions
+    frame_height, frame_width = background_frames[0].shape[:2]
+    
+    # Calculate dimensions for each camera view (2 rows × 3 columns)
+    H = frame_height // 2  # Height per camera
+    W = frame_width // 3   # Width per camera
+    
+    # Initialize output tensor [T, 6, 3, H, W]
+    background_tensor = torch.zeros(T, 6, 3, H, W, dtype=torch.float32)
+    
+    # Camera arrangement: 
+    # [CAM_FRONT_LEFT, CAM_FRONT, CAM_FRONT_RIGHT]  # Top row (cameras 0, 1, 2)
+    # [CAM_BACK_LEFT,  CAM_BACK,  CAM_BACK_RIGHT]   # Bottom row (cameras 3, 4, 5)
+    
+    for t, frame in enumerate(background_frames):
+        # Convert frame to float and normalize to [0, 1]
+        frame_tensor = torch.from_numpy(frame.astype(np.float32) / 255.0)
+        
+        # Split frame into 6 camera views
+        for row in range(2):
+            for col in range(3):
+                cam_idx = row * 3 + col  # Camera index (0-5)
+                
+                # Extract camera region
+                y_start = row * H
+                y_end = (row + 1) * H
+                x_start = col * W
+                x_end = (col + 1) * W
+                
+                # Extract and permute to [3, H, W] format
+                cam_frame = frame_tensor[y_start:y_end, x_start:x_end, :].permute(2, 0, 1)
+                background_tensor[t, cam_idx] = cam_frame
+    # swap back left and back right
+    background_tensor[:, [3, 5]] = background_tensor[:, [5, 3]]
+    print(f"Created background tensor with shape {background_tensor.shape}")
+    print(f"Each camera view has dimensions: {H}x{W}")
+    
+    return background_tensor
+
 def get_device(local_rank=None):
     """Get the appropriate device based on rank."""
     if torch.cuda.is_available():
@@ -168,7 +447,6 @@ def initialize_pipelines(device="cuda", local_rank=None):
     openpose_pipe.to(device)
 
     # Initialize paint pipeline directly here to be shared across all objects
-
     paint_pipeline = Hunyuan3DPaintPipeline.from_pretrained(
         "tencent/Hunyuan3D-2", subfolder="hunyuan3d-paint-v2-0-turbo"
     )
@@ -176,7 +454,10 @@ def initialize_pipelines(device="cuda", local_rank=None):
     paint_pipeline.render.device = str(device)
     paint_pipeline.load_models()
 
-    return openpose_pipe, paint_pipeline
+    # Initialize UniDepth model for depth estimation
+    unidepth_model = initialize_unidepth_model(device)
+
+    return openpose_pipe, paint_pipeline, unidepth_model
 
 
 def rpy2rotations(roll, pitch, yaw, device="cuda"):
@@ -665,6 +946,45 @@ def all_to_camera_front(nusc, cam_calib_tokens):
     return ret, cam_front_to_ego
 
 
+def combine_background_and_human_splats(background_point_cloud_for_frame, human_gs, cam_idx):
+    """Combine background point clouds with human Gaussian splats for a specific frame and camera.
+    
+    Args:
+        background_point_cloud_for_frame: List of 6 background point clouds for this frame (one per camera)
+        human_gs: Human Gaussian splats dict
+        cam_idx: Camera index
+    
+    Returns:
+        dict: Combined Gaussian splats
+    """
+    if background_point_cloud_for_frame is None:
+        return human_gs
+    
+    if human_gs is None:
+        # Only background, no humans
+        if cam_idx < len(background_point_cloud_for_frame):
+            return background_point_cloud_for_frame[cam_idx]
+        else:
+            return None
+    
+    # Combine background and human splats
+    if cam_idx < len(background_point_cloud_for_frame):
+        bg_gs = background_point_cloud_for_frame[cam_idx]
+        
+        # Check if background has points
+        if bg_gs["xyz"].shape[0] > 0:
+            combined_gs = {}
+            for key in human_gs.keys():
+                if key in bg_gs:
+                    combined_gs[key] = torch.vstack([bg_gs[key], human_gs[key]])
+                else:
+                    combined_gs[key] = human_gs[key]
+            return combined_gs
+    
+    # Fallback to human only
+    return human_gs
+
+
 def render_gaussian(gaussian, extrinsics, intrinsics, width=800, height=424):
     if gaussian is None:
         return (
@@ -673,8 +993,8 @@ def render_gaussian(gaussian, extrinsics, intrinsics, width=800, height=424):
         )
     extrinsics = torch.tensor(extrinsics).float().cuda()
     intrinsics = torch.tensor(intrinsics).float().cuda()
-    intrinsics[0] *= width / 1600
-    intrinsics[1] *= height / 900
+    intrinsics[0] *= width
+    intrinsics[1] *= height
     means = gaussian["xyz"]
     rgbs = gaussian["rgbs"]
     opacities = gaussian["opacities"]
@@ -707,7 +1027,8 @@ def render_gaussian(gaussian, extrinsics, intrinsics, width=800, height=424):
 
 
 def render(
-    gs, intrinsics, extrinsics, save_path="render.png", mask_save_path="mask.png"
+    gs, intrinsics, extrinsics, save_path="render.png", mask_save_path="mask.png", 
+    background_point_clouds=None, frame_idx=None
 ):
     cams = ['CAM_FRONT_LEFT', 'CAM_FRONT', 'CAM_FRONT_RIGHT', 'CAM_BACK_LEFT', 'CAM_BACK', 'CAM_BACK_RIGHT']
     images = []
@@ -715,7 +1036,14 @@ def render(
     for i in range(len(cams)):
         intrinsic = intrinsics[cams[i]]
         extrinsic = extrinsics[cams[i]]
-        img, mask = render_gaussian(gs, extrinsic, intrinsic)
+        
+        # Combine with background point clouds if available
+        # background_point_clouds now contains the point clouds for this specific frame
+        combined_gs = combine_background_and_human_splats(
+            background_point_clouds, gs, i
+        ) if background_point_clouds is not None else gs
+        
+        img, mask = render_gaussian(combined_gs, extrinsic, intrinsic)
         img = img[0].detach().cpu().numpy()
         img = Image.fromarray((img * 255).astype(np.uint8))
         images.append(img)
@@ -826,6 +1154,13 @@ def parse_args():
         default=12355,
         help="Master port for distributed training.",
     )
+    parser.add_argument(
+        "--background",
+        type=str,
+        default=None,
+        help="Path to background video"
+
+    )
     return parser.parse_args()
 
 
@@ -856,7 +1191,7 @@ def main_worker(rank, world_size, args):
     )
 
     # Initialize the diffusion pipeline on the appropriate device
-    openpose_pipe, paint_pipeline = initialize_pipelines(
+    openpose_pipe, paint_pipeline, unidepth_model = initialize_pipelines(
         device, rank if distributed_success and world_size > 1 else None
     )
 
@@ -918,6 +1253,9 @@ def main_worker(rank, world_size, args):
                     )
                     for cam in cam_tokens
                 }
+                for cam in cam_tokens:
+                    intrinsics[cam][0] /= cam_data[cam]["width"]
+                    intrinsics[cam][1] /= cam_data[cam]["height"]
                 extrinsics, cam_front_to_ego = all_to_camera_front(
                     nusc, cam_calib_tokens
                 )
@@ -1126,6 +1464,15 @@ def main_worker(rank, world_size, args):
         # Each rank renders its assigned subset of frames
         total_frames = scene["nbr_samples"] * interpolation_factor
 
+        # Load background video if provided
+        background_tensor = None
+        background_point_clouds = None
+        if args.background:
+            background_tensor = load_background_video(args.background, target_fps=args.hz)
+            total_frames = min(total_frames, background_tensor.shape[0])
+            if background_tensor is not None:
+                print(f"Rank {rank}: Background video loaded with shape {background_tensor.shape}")
+
         # Distribute frames across all GPUs for parallel rendering
         frames_per_gpu_base = (
             total_frames // world_size
@@ -1148,13 +1495,39 @@ def main_worker(rank, world_size, args):
                 )
                 end_frame = start_frame + frames_per_gpu_base
 
-            # print(
-            #     f"Rank {rank}: Rendering frames {start_frame}-{end_frame-1} ({end_frame - start_frame} frames)"
-            # )
+            print(f"Rank {rank}: Processing frames {start_frame}-{end_frame-1} ({end_frame - start_frame} frames)")
+            
+            # Process background depth for assigned frames only (distributed processing)
+            if background_tensor is not None:
+                print(f"Rank {rank}: Processing background depth for assigned frames...")
+                background_point_clouds = {}
+                for t in range(start_frame, end_frame):
+                    frame_point_clouds = process_background_frame_with_depth(
+                        background_tensor, t, intrinsics, extrinsics, unidepth_model, device
+                    )
+                    if frame_point_clouds is not None:
+                        background_point_clouds[t] = frame_point_clouds
+                    else:
+                        background_point_clouds[t] = None
+                print(f"Rank {rank}: ✓ Background depth processing complete for {len(background_point_clouds)} frames")
         else:
             start_frame = 0
             end_frame = total_frames
             print(f"Single GPU: Rendering all {total_frames} frames")
+            
+            # Process background depth for all frames (single GPU)
+            if background_tensor is not None:
+                print("Processing background depth for all frames...")
+                background_point_clouds = {}
+                for t in range(total_frames):
+                    frame_point_clouds = process_background_frame_with_depth(
+                        background_tensor, t, intrinsics, extrinsics, unidepth_model, device
+                    )
+                    if frame_point_clouds is not None:
+                        background_point_clouds[t] = frame_point_clouds
+                    else:
+                        background_point_clouds[t] = None
+                print(f"✓ Background depth processing complete for {len(background_point_clouds)} frames")
 
         # Create output directory
         os.makedirs(
@@ -1212,6 +1585,8 @@ def main_worker(rank, world_size, args):
                 extrinsics,
                 save_path=image_path,
                 mask_save_path=mask_path,
+                background_point_clouds=background_point_clouds.get(t) if background_point_clouds else None,
+                frame_idx=t,
             )
 
         # Synchronize all processes after rendering
@@ -1245,7 +1620,7 @@ def main_worker(rank, world_size, args):
                 )
 
             with imageio.get_writer(
-                f"val_videos_{args.hz}hz/{scene_idx if args.scene_idx is None else args.scene_idx[scene_idx]}/rgbs.mp4",
+                f"val_videos_{args.hz}hz/{scene_idx if args.scene_idx is None else args.scene_idx[scene_idx]}/" + "rgbs_w_background.mp4" if args.background else "rgbs_wo_background.mp4",
                 mode="I",
                 fps=args.hz,
                 format="FFMPEG",
@@ -1261,7 +1636,7 @@ def main_worker(rank, world_size, args):
                 f"val_videos_{args.hz}hz/{scene_idx if args.scene_idx is None else args.scene_idx[scene_idx]}/rendered_images"
             )
             print(
-                f"✓ Video saved: val_videos_{args.hz}hz/{scene_idx if args.scene_idx is None else args.scene_idx[scene_idx]}/rgbs.mp4"
+                f"✓ Video saved: val_videos_{args.hz}hz/{scene_idx if args.scene_idx is None else args.scene_idx[scene_idx]}/" + "rgbs_w_background.mp4" if args.background else "rgbs_wo_background.mp4"
             )
             with imageio.get_writer(
                 f"val_videos_{args.hz}hz/{scene_idx if args.scene_idx is None else args.scene_idx[scene_idx]}/masks.mp4",
