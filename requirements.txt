@@ -1,12 +1,12 @@
 ninja
 pybind11
 
-diffusers
+diffusers==0.35.1
 einops
 opencv-python
 numpy
 torch
-transformers
+transformers==4.56.2
 torchvision
 #taming-transformers-rom1504
 #ConfigArgParse
