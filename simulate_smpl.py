@@ -23,6 +23,7 @@ from diffusers import ControlNetModel, StableDiffusionXLControlNetPipeline, Stab
 from smpl.smpl import SMPL
 from hy3dgen.texgen import Hunyuan3DPaintPipeline
 
+CAMS = ['CAM_FRONT_LEFT', 'CAM_FRONT', 'CAM_FRONT_RIGHT', 'CAM_BACK_RIGHT', 'CAM_BACK', 'CAM_BACK_LEFT']
 
 def initialize_unidepth_model(device="cuda", version="v2", backbone="vitl14"):
     """Initialize UniDepth model using torch.hub."""
@@ -190,7 +191,7 @@ def process_background_frame_with_depth(background_tensor, frame_idx, intrinsics
         return None
     
     T, num_cams, C, H, W = background_tensor.shape
-    cams = ['CAM_FRONT_LEFT', 'CAM_FRONT', 'CAM_FRONT_RIGHT', 'CAM_BACK_LEFT', 'CAM_BACK', 'CAM_BACK_RIGHT']
+    cams = CAMS
     
     # Pre-compute intrinsics tensors and camera transforms for batched processing
     intrinsics_tensors = []
@@ -909,6 +910,81 @@ class Object3D:
         gs = transform_gs(transformation_matrix, gs)
         return gs
 
+def create_box_gaussian_splats(size, device="cuda", density=20):
+    """Create Gaussian splats representing a 3D bounding box for occlusion.
+    
+    Args:
+        size: [width, length, height] dimensions of the box in NuScenes format
+        device: device to use
+        density: number of points per meter (controls point cloud density)
+    
+    Returns:
+        dict: Gaussian splats in standard format
+    """
+    # NuScenes format: [width, length, height]
+    # We need to swap width and length to match the coordinate system
+    # Similar to how it's done for SMPL objects
+    width, length, height = size
+    width, length = length, width  # Swap to match coordinate frame
+    
+    # Calculate number of points based on surface area and density
+    num_points_w = max(3, int(width * density))
+    num_points_l = max(3, int(length * density))
+    num_points_h = max(3, int(height * density))
+    
+    points = []
+    
+    # Generate points on all 6 faces of the box
+    # Front and back faces (x-z plane)
+    for y_val in [-length/2, length/2]:
+        x = torch.linspace(-width/2, width/2, num_points_w, device=device)
+        z = torch.linspace(-height/2, height/2, num_points_h, device=device)
+        xv, zv = torch.meshgrid(x, z, indexing='xy')
+        yv = torch.full_like(xv, y_val)
+        points.append(torch.stack([xv.flatten(), yv.flatten(), zv.flatten()], dim=1))
+    
+    # Left and right faces (y-z plane)
+    for x_val in [-width/2, width/2]:
+        y = torch.linspace(-length/2, length/2, num_points_l, device=device)
+        z = torch.linspace(-height/2, height/2, num_points_h, device=device)
+        yv, zv = torch.meshgrid(y, z, indexing='xy')
+        xv = torch.full_like(yv, x_val)
+        points.append(torch.stack([xv.flatten(), yv.flatten(), zv.flatten()], dim=1))
+    
+    # Top and bottom faces (x-y plane)
+    for z_val in [-height/2, height/2]:
+        x = torch.linspace(-width/2, width/2, num_points_w, device=device)
+        y = torch.linspace(-length/2, length/2, num_points_l, device=device)
+        xv, yv = torch.meshgrid(x, y, indexing='xy')
+        zv = torch.full_like(xv, z_val)
+        points.append(torch.stack([xv.flatten(), yv.flatten(), zv.flatten()], dim=1))
+    
+    # Concatenate all points
+    xyz = torch.cat(points, dim=0)
+    N = xyz.shape[0]
+    
+    # Create white color for occlusion objects
+    rgbs = torch.ones(N, 3, device=device) * 1.0  # White color
+    
+    # Fully opaque for proper occlusion
+    opacities = torch.ones(N, 1, device=device) * 1.0
+    
+    # Small uniform scales
+    scales = torch.ones(N, 3, device=device) * 0.05
+    
+    # Identity rotations
+    rots = torch.zeros(N, 4, device=device)
+    rots[:, 0] = 1.0  # w = 1
+    
+    return {
+        "xyz": xyz,
+        "rgbs": rgbs,
+        "opacities": opacities,
+        "scales": scales,
+        "rots": rots
+    }
+
+
 def get_obj_to_cam_front(rotation, translation, cam_front_to_world):
     '''
     Args:
@@ -985,7 +1061,7 @@ def combine_background_and_human_splats(background_point_cloud_for_frame, human_
     return human_gs
 
 
-def render_gaussian(gaussian, extrinsics, intrinsics, width=800, height=424):
+def render_gaussian(gaussian, extrinsics, intrinsics, width=800, height=424, mask_colors=None):
     if gaussian is None:
         return (
             torch.ones(1, height, width, 3).cuda(),
@@ -1022,15 +1098,43 @@ def render_gaussian(gaussian, extrinsics, intrinsics, width=800, height=424):
         backgrounds=torch.ones(1, 3).cuda(),
     )
     renders = torch.clamp(renders, max=1.0)
-    masks = (alphas > 0).bool()
+    
+    # Render mask with same scene but different colors
+    # Humans = white (1.0), Bounding boxes = black (0.0), Background = black (0.0)
+    if mask_colors is not None:
+        mask_renders, _, _ = rasterization(
+            means=means,
+            quats=rotations,
+            scales=scales,
+            opacities=opacities.squeeze(),
+            colors=mask_colors,  # Custom colors: humans=white, bboxes=black
+            viewmats=torch.linalg.inv(extrinsics)[None, ...],
+            Ks=intrinsics[None, ...],
+            width=width,
+            height=height,
+            packed=False,
+            absgrad=True,
+            sparse_grad=False,
+            rasterize_mode="classic",
+            near_plane=0.1,
+            far_plane=10000000000.0,
+            render_mode="RGB",
+            radius_clip=0.0,
+            backgrounds=torch.zeros(1, 3).cuda(),  # Black background
+        )
+        # Mask is where white (human) is visible after occlusion
+        masks = (mask_renders[..., 0] > 0.5).unsqueeze(-1)  # Threshold at 0.5
+    else:
+        masks = (alphas > 0).bool()
+    
     return renders, masks
 
 
 def render(
     gs, intrinsics, extrinsics, save_path="render.png", mask_save_path="mask.png", 
-    background_point_clouds=None, frame_idx=None
+    background_point_clouds=None, frame_idx=None, human_only_gs=None
 ):
-    cams = ['CAM_FRONT_LEFT', 'CAM_FRONT', 'CAM_FRONT_RIGHT', 'CAM_BACK_LEFT', 'CAM_BACK', 'CAM_BACK_RIGHT']
+    cams = CAMS
     images = []
     masks = []
     for i in range(len(cams)):
@@ -1043,7 +1147,33 @@ def render(
             background_point_clouds, gs, i
         ) if background_point_clouds is not None else gs
         
-        img, mask = render_gaussian(combined_gs, extrinsic, intrinsic)
+        # Create mask colors: white for humans and background if given, black for bounding boxes if background is not given
+        mask_colors = None
+        if combined_gs is not None:
+            # Count splats: background + humans + bboxes
+            num_bg = 0
+            if background_point_clouds is not None and i < len(background_point_clouds):
+                bg_gs = background_point_clouds[i]
+                if bg_gs["xyz"].shape[0] > 0:
+                    num_bg = bg_gs["xyz"].shape[0]
+            
+            num_humans = human_only_gs["xyz"].shape[0] if human_only_gs is not None else 0
+            num_total = combined_gs["xyz"].shape[0]
+            
+            # Create color tensor: [num_total, 3]
+            mask_colors = torch.zeros(num_total, 3, device=combined_gs["xyz"].device)
+            
+            # Order of splats in combined_gs:
+            # With background: [background, humans]
+            # Without background: [humans, bboxes]
+            
+            # Background splats: black (0, 0, 0) - indices [0:num_bg]
+            # Human splats: white (1, 1, 1) - indices [num_bg:num_bg+num_humans]
+            if num_humans > 0:
+                mask_colors[num_bg:num_bg+num_humans, :] = 1.0
+            if background_point_clouds is not None:
+                mask_colors[:num_bg, :] = 1.0
+        img, mask = render_gaussian(combined_gs, extrinsic, intrinsic, mask_colors=mask_colors)
         img = img[0].detach().cpu().numpy()
         img = Image.fromarray((img * 255).astype(np.uint8))
         images.append(img)
@@ -1215,17 +1345,11 @@ def main_worker(rank, world_size, args):
     for scene_idx, scene in enumerate(val_scenes):
         sample = None
         objects = {}
-        cams = [
-            "CAM_FRONT_LEFT",
-            "CAM_FRONT",
-            "CAM_FRONT_RIGHT",
-            "CAM_BACK_LEFT",
-            "CAM_BACK",
-            "CAM_BACK_RIGHT",
-        ]
+        cams = CAMS
         # Collect new objects to create in parallel
         humans_to_create = []
         existing_humans = []
+        existing_bboxes = []
         annotations_2hz = {}
         positions = {}
         current_to_initial_cam_front_2hz = {}
@@ -1270,10 +1394,40 @@ def main_worker(rank, world_size, args):
             )
             for _, ann_token in enumerate(sample["anns"]):
                 ann = nusc.get("sample_annotation", ann_token)
-                if not ann["category_name"].startswith("human."):
-                    continue
                 size = ann["size"]
                 inst_token = ann["instance_token"]
+                
+                # Handle non-human objects as bounding boxes for occlusion
+                # Only create bounding boxes if no background video is provided
+                if not ann["category_name"].startswith("human."):
+                    if args.background is None:
+                        # Create bounding box representation for occlusion (only when no background)
+                        if inst_token not in existing_bboxes:
+                            # Create box Gaussian splats on first encounter
+                            box_gs = create_box_gaussian_splats(
+                                size=size,
+                                device=device
+                            )
+                            objects[inst_token] = {
+                                'type': 'bbox',
+                                'size': size,
+                                'gs_template': box_gs
+                            }
+                            existing_bboxes.append(inst_token)
+                        
+                        # Store transformation for this frame
+                        obj_to_cam_front = get_obj_to_cam_front(
+                            ann["rotation"],
+                            ann["translation"],
+                            cam_front_to_world,
+                        )
+                        if inst_token in annotations_2hz:
+                            annotations_2hz[inst_token][t] = obj_to_cam_front
+                            positions[inst_token][t] = ann["translation"]
+                        else:
+                            annotations_2hz[inst_token] = {t: obj_to_cam_front}
+                            positions[inst_token] = {t: ann["translation"]}
+                    continue
 
                 if inst_token not in existing_humans:
                     if ann["category_name"] == "human.pedestrian.police_officer":
@@ -1335,35 +1489,48 @@ def main_worker(rank, world_size, args):
                 mat2 = annotations_2hz[inst_token][t2]
                 pos1 = np.array(positions[inst_token][t1])
                 pos2 = np.array(positions[inst_token][t2])
-                velocities.append(
-                    np.sum((pos2 - pos1) ** 2) ** 0.5 / (t2 - t1) * 2
-                )  # annotations are at 2hz
-                # Add the first keyframe
-                for interp_step in range(interpolation_factor):
-                    interp_t = t1 * interpolation_factor + interp_step
-                    if interp_step == 0:
-                        # Use exact keyframe
-                        annotations_required[inst_token][interp_t] = mat1
-                    else:
-                        # Interpolate
-                        alpha = interp_step / interpolation_factor
-                        interp_mat = interpolate_transform_matrix(mat1, mat2, alpha)
-                        annotations_required[inst_token][interp_t] = interp_mat
+                
+                # Check if frames are consecutive (only interpolate if consecutive)
+                if t2 == t1 + 1:
+                    # Consecutive frames - interpolate between them
+                    velocities.append(
+                        np.sum((pos2 - pos1) ** 2) ** 0.5 / (t2 - t1) * 2
+                    )  # annotations are at 2hz
+                    # Add the first keyframe and interpolations
+                    for interp_step in range(interpolation_factor):
+                        interp_t = t1 * interpolation_factor + interp_step
+                        if interp_step == 0:
+                            # Use exact keyframe
+                            annotations_required[inst_token][interp_t] = mat1
+                        else:
+                            # Interpolate
+                            alpha = interp_step / interpolation_factor
+                            interp_mat = interpolate_transform_matrix(mat1, mat2, alpha)
+                            annotations_required[inst_token][interp_t] = interp_mat
+                else:
+                    # Non-consecutive frames - only show at exact keyframe t1
+                    interp_t = t1 * interpolation_factor
+                    annotations_required[inst_token][interp_t] = mat1
 
-            # Add the last keyframe
+            # Add the last keyframe (always just the exact frame, no interpolation beyond it)
             if time_keys:
                 last_t = time_keys[-1]
-                for interp_step in range(interpolation_factor):
-                    interp_t = last_t * interpolation_factor + interp_step
-                    if interp_step == 0:
-                        annotations_required[inst_token][interp_t] = annotations_2hz[
-                            inst_token
-                        ][last_t]
-                    else:
-                        # For the last frame, just repeat the last pose
-                        annotations_required[inst_token][interp_t] = annotations_2hz[
-                            inst_token
-                        ][last_t]
+                interp_t = last_t * interpolation_factor
+                # Check if last frame was already added (if it was consecutive with previous)
+                if interp_t not in annotations_required[inst_token]:
+                    annotations_required[inst_token][interp_t] = annotations_2hz[
+                        inst_token
+                    ][last_t]
+                else:
+                    # If it was already added, we need to add the remaining interpolation steps
+                    # for the last segment (from second-to-last to last)
+                    if len(time_keys) >= 2 and time_keys[-1] == time_keys[-2] + 1:
+                        # Last two frames are consecutive, add remaining interpolation steps
+                        for interp_step in range(1, interpolation_factor):
+                            interp_t = last_t * interpolation_factor + interp_step
+                            annotations_required[inst_token][interp_t] = annotations_2hz[
+                                inst_token
+                            ][last_t]
             avg_velocity = sum(velocities) / len(velocities) if velocities else 0
             if avg_velocity > 4.0:  # running
                 pose_key = "run"
@@ -1462,7 +1629,11 @@ def main_worker(rank, world_size, args):
 
         # Now ALL ranks participate in distributed frame rendering
         # Each rank renders its assigned subset of frames
-        total_frames = scene["nbr_samples"] * interpolation_factor
+        # Calculate total frames based on scene duration and interpolation
+        # With nbr_samples keyframes at 2Hz, we have (nbr_samples - 1) intervals
+        # Each interval is divided into interpolation_factor frames
+        # Plus 1 for the final keyframe: (nbr_samples - 1) * interpolation_factor + 1
+        total_frames = (scene["nbr_samples"] - 1) * interpolation_factor + 1
 
         # Load background video if provided
         background_tensor = None
@@ -1543,30 +1714,68 @@ def main_worker(rank, world_size, args):
         # Render assigned frames - each rank renders its subset
         for t in trange(start_frame, end_frame, desc=f"Rank {rank} rendering"):
             gs = None
-            current_smpl_gs = []
+            human_only_gs = None
+            current_human_gs = []
+            current_bbox_gs = []
+            
+            # First pass: collect humans
             for inst_token in objects.keys():
                 if t not in annotations_required[inst_token]:
                     continue
+                
                 obj = objects[inst_token]
                 obj_to_cam_front = annotations_required[inst_token][t]
-                obj_gs = obj.transform_gs(
-                    obj_to_cam_front, (t * 120) // args.hz
-                )  # smpl poses are at 120hz
-                current_smpl_gs.append(obj_gs)
-
-            if current_smpl_gs:
-                gs = current_smpl_gs[0]
-                for obj_gs in current_smpl_gs[1:]:
+                
+                # Only process humans in first pass
+                if not (isinstance(obj, dict) and obj.get('type') == 'bbox'):
+                    # Transform human SMPL Gaussian splats
+                    obj_gs = obj.transform_gs(
+                        obj_to_cam_front, (t * 120) // args.hz
+                    )  # smpl poses are at 120hz
+                    current_human_gs.append(obj_gs)
+            
+            # Second pass: collect bounding boxes
+            for inst_token in objects.keys():
+                if t not in annotations_required[inst_token]:
+                    continue
+                
+                obj = objects[inst_token]
+                obj_to_cam_front = annotations_required[inst_token][t]
+                
+                # Only process bounding boxes in second pass
+                if isinstance(obj, dict) and obj.get('type') == 'bbox':
+                    # Transform bounding box Gaussian splats
+                    box_gs = deepcopy(obj['gs_template'])
+                    obj_gs = transform_gs(obj_to_cam_front, box_gs)
+                    current_bbox_gs.append(obj_gs)
+            
+            # Combine: humans first, then bboxes
+            if args.background is not None:
+                assert len(current_bbox_gs) == 0, "Bounding boxes should not be created when background video is provided"
+                all_gs = current_human_gs
+            else:
+                all_gs = current_human_gs + current_bbox_gs
+            if all_gs:
+                gs = deepcopy(all_gs[0])
+                for obj_gs in all_gs[1:]:
                     for key in gs.keys():
                         gs[key] = torch.vstack([gs[key], obj_gs[key]])
             else:
                 gs = None
+            # Create human-only splats for mask generation
+            if current_human_gs:
+                human_only_gs = deepcopy(current_human_gs[0])
+                for obj_gs in current_human_gs[1:]:
+                    for key in human_only_gs.keys():
+                        human_only_gs[key] = torch.vstack([human_only_gs[key], obj_gs[key]])
+            else:
+                human_only_gs = None
 
             # Save splats if requested
-            if args.save_splats and gs is not None:
+            if args.save_splats and human_only_gs is not None:
                 current_to_initial_cam_front = current_to_initial_cam_front_required[t]
                 gs_in_initial_cam_front = transform_gs(
-                    current_to_initial_cam_front, deepcopy(gs)
+                    current_to_initial_cam_front, deepcopy(human_only_gs)
                 )
                 os.makedirs(
                     f"val_videos_{args.hz}hz/{scene_idx if args.scene_idx is None else args.scene_idx[scene_idx]}/splats",
@@ -1587,6 +1796,7 @@ def main_worker(rank, world_size, args):
                 mask_save_path=mask_path,
                 background_point_clouds=background_point_clouds.get(t) if background_point_clouds else None,
                 frame_idx=t,
+                human_only_gs=human_only_gs,
             )
 
         # Synchronize all processes after rendering
@@ -1620,7 +1830,7 @@ def main_worker(rank, world_size, args):
                 )
 
             with imageio.get_writer(
-                f"val_videos_{args.hz}hz/{scene_idx if args.scene_idx is None else args.scene_idx[scene_idx]}/" + "rgbs_w_background.mp4" if args.background else "rgbs_wo_background.mp4",
+                f"val_videos_{args.hz}hz/{scene_idx if args.scene_idx is None else args.scene_idx[scene_idx]}/" + ("rgbs_w_background.mp4" if args.background else "rgbs_wo_background.mp4"),
                 mode="I",
                 fps=args.hz,
                 format="FFMPEG",
@@ -1636,7 +1846,7 @@ def main_worker(rank, world_size, args):
                 f"val_videos_{args.hz}hz/{scene_idx if args.scene_idx is None else args.scene_idx[scene_idx]}/rendered_images"
             )
             print(
-                f"✓ Video saved: val_videos_{args.hz}hz/{scene_idx if args.scene_idx is None else args.scene_idx[scene_idx]}/" + "rgbs_w_background.mp4" if args.background else "rgbs_wo_background.mp4"
+                f"✓ Video saved: val_videos_{args.hz}hz/{scene_idx if args.scene_idx is None else args.scene_idx[scene_idx]}/" + ("rgbs_w_background.mp4" if args.background else "rgbs_wo_background.mp4")
             )
             with imageio.get_writer(
                 f"val_videos_{args.hz}hz/{scene_idx if args.scene_idx is None else args.scene_idx[scene_idx]}/masks.mp4",

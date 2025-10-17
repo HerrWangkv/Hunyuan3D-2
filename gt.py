@@ -9,8 +9,10 @@ import imageio.v2 as imageio
 import argparse
 from PIL import Image
 
+CAMS = ['CAM_FRONT_LEFT', 'CAM_FRONT', 'CAM_FRONT_RIGHT', 'CAM_BACK_RIGHT', 'CAM_BACK', 'CAM_BACK_LEFT']
+
 def save_img(nusc, sample, save_path):
-    cams = ['CAM_FRONT_LEFT', 'CAM_FRONT', 'CAM_FRONT_RIGHT', 'CAM_BACK_LEFT', 'CAM_BACK', 'CAM_BACK_RIGHT']
+    cams = CAMS
     images = []
     for cam in cams:
         sample_data = nusc.get('sample_data', sample['data'][cam])
