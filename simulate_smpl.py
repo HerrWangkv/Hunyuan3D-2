@@ -1061,7 +1061,7 @@ def combine_background_and_human_splats(background_point_cloud_for_frame, human_
     return human_gs
 
 
-def render_gaussian(gaussian, extrinsics, intrinsics, width=800, height=424, mask_colors=None):
+def render_gaussian(gaussian, extrinsics, intrinsics, width, height, mask_colors=None):
     if gaussian is None:
         return (
             torch.ones(1, height, width, 3).cuda(),
@@ -1131,7 +1131,7 @@ def render_gaussian(gaussian, extrinsics, intrinsics, width=800, height=424, mas
 
 
 def render(
-    gs, intrinsics, extrinsics, save_path="render.png", mask_save_path="mask.png", 
+    gs, intrinsics, extrinsics, width, height, save_path="render.png", mask_save_path="mask.png", 
     background_point_clouds=None, frame_idx=None, human_only_gs=None
 ):
     cams = CAMS
@@ -1173,7 +1173,7 @@ def render(
                 mask_colors[num_bg:num_bg+num_humans, :] = 1.0
             if background_point_clouds is not None:
                 mask_colors[:num_bg, :] = 1.0
-        img, mask = render_gaussian(combined_gs, extrinsic, intrinsic, mask_colors=mask_colors)
+        img, mask = render_gaussian(combined_gs, extrinsic, intrinsic, width, height, mask_colors=mask_colors)
         img = img[0].detach().cpu().numpy()
         img = Image.fromarray((img * 255).astype(np.uint8))
         images.append(img)
@@ -1290,6 +1290,18 @@ def parse_args():
         default=None,
         help="Path to background video"
 
+    )
+    parser.add_argument(
+        "--width",
+        type=int,
+        default=1600,
+        help="Width of the rendered image."
+    )
+    parser.add_argument(
+        "--height",
+        type=int,
+        default=848,
+        help="Height of the rendered image."
     )
     return parser.parse_args()
 
@@ -1702,11 +1714,11 @@ def main_worker(rank, world_size, args):
 
         # Create output directory
         os.makedirs(
-            f"val_videos_{args.hz}hz/{scene_idx if args.scene_idx is None else args.scene_idx[scene_idx]}/rendered_images",
+            f"val_videos_{args.hz}hz_{args.height}x{args.width}/{scene_idx if args.scene_idx is None else args.scene_idx[scene_idx]}/rendered_images",
             exist_ok=True,
         )
         os.makedirs(
-            f"val_videos_{args.hz}hz/{scene_idx if args.scene_idx is None else args.scene_idx[scene_idx]}/rendered_masks",
+            f"val_videos_{args.hz}hz_{args.height}x{args.width}/{scene_idx if args.scene_idx is None else args.scene_idx[scene_idx]}/rendered_masks",
             exist_ok=True,
         )
 
@@ -1778,20 +1790,22 @@ def main_worker(rank, world_size, args):
                     current_to_initial_cam_front, deepcopy(human_only_gs)
                 )
                 os.makedirs(
-                    f"val_videos_{args.hz}hz/{scene_idx if args.scene_idx is None else args.scene_idx[scene_idx]}/splats",
+                    f"val_videos_{args.hz}hz_{args.height}x{args.width}/{scene_idx if args.scene_idx is None else args.scene_idx[scene_idx]}/splats",
                     exist_ok=True,
                 )
-                splat_path = f"val_videos_{args.hz}hz/{scene_idx if args.scene_idx is None else args.scene_idx[scene_idx]}/splats/frame_{t:04d}.pt"
+                splat_path = f"val_videos_{args.hz}hz_{args.height}x{args.width}/{scene_idx if args.scene_idx is None else args.scene_idx[scene_idx]}/splats/frame_{t:04d}.pt"
                 torch.save(gs_in_initial_cam_front, splat_path)
 
             # Save the rendered image for the current frame
-            image_path = f"val_videos_{args.hz}hz/{scene_idx if args.scene_idx is None else args.scene_idx[scene_idx]}/rendered_images/frame_{t:04d}.png"
-            mask_path = f"val_videos_{args.hz}hz/{scene_idx if args.scene_idx is None else args.scene_idx[scene_idx]}/rendered_masks/frame_{t:04d}.png"
+            image_path = f"val_videos_{args.hz}hz_{args.height}x{args.width}/{scene_idx if args.scene_idx is None else args.scene_idx[scene_idx]}/rendered_images/frame_{t:04d}.png"
+            mask_path = f"val_videos_{args.hz}hz_{args.height}x{args.width}/{scene_idx if args.scene_idx is None else args.scene_idx[scene_idx]}/rendered_masks/frame_{t:04d}.png"
 
             render(
                 gs,
                 intrinsics,
                 extrinsics,
+                width=args.width,
+                height=args.height,
                 save_path=image_path,
                 mask_save_path=mask_path,
                 background_point_clouds=background_point_clouds.get(t) if background_point_clouds else None,
@@ -1810,12 +1824,12 @@ def main_worker(rank, world_size, args):
             print(f"Assembling video from all {total_frames} frames...")
             frame_paths = sorted(
                 glob.glob(
-                    f"val_videos_{args.hz}hz/{scene_idx if args.scene_idx is None else args.scene_idx[scene_idx]}/rendered_images/frame_*.png"
+                    f"val_videos_{args.hz}hz_{args.height}x{args.width}/{scene_idx if args.scene_idx is None else args.scene_idx[scene_idx]}/rendered_images/frame_*.png"
                 )
             )
             mask_paths = sorted(
                 glob.glob(
-                    f"val_videos_{args.hz}hz/{scene_idx if args.scene_idx is None else args.scene_idx[scene_idx]}/rendered_masks/frame_*.png"
+                    f"val_videos_{args.hz}hz_{args.height}x{args.width}/{scene_idx if args.scene_idx is None else args.scene_idx[scene_idx]}/rendered_masks/frame_*.png"
                 )
             )
 
@@ -1830,7 +1844,7 @@ def main_worker(rank, world_size, args):
                 )
 
             with imageio.get_writer(
-                f"val_videos_{args.hz}hz/{scene_idx if args.scene_idx is None else args.scene_idx[scene_idx]}/" + ("rgbs_w_background.mp4" if args.background else "rgbs_wo_background.mp4"),
+                f"val_videos_{args.hz}hz_{args.height}x{args.width}/{scene_idx if args.scene_idx is None else args.scene_idx[scene_idx]}/" + ("rgbs_w_background.mp4" if args.background else "rgbs_wo_background.mp4"),
                 mode="I",
                 fps=args.hz,
                 format="FFMPEG",
@@ -1843,13 +1857,13 @@ def main_worker(rank, world_size, args):
             for frame_path in frame_paths:
                 os.remove(frame_path)
             os.rmdir(
-                f"val_videos_{args.hz}hz/{scene_idx if args.scene_idx is None else args.scene_idx[scene_idx]}/rendered_images"
+                f"val_videos_{args.hz}hz_{args.height}x{args.width}/{scene_idx if args.scene_idx is None else args.scene_idx[scene_idx]}/rendered_images"
             )
             print(
-                f"✓ Video saved: val_videos_{args.hz}hz/{scene_idx if args.scene_idx is None else args.scene_idx[scene_idx]}/" + ("rgbs_w_background.mp4" if args.background else "rgbs_wo_background.mp4")
+                f"✓ Video saved: val_videos_{args.hz}hz_{args.height}x{args.width}/{scene_idx if args.scene_idx is None else args.scene_idx[scene_idx]}/" + ("rgbs_w_background.mp4" if args.background else "rgbs_wo_background.mp4")
             )
             with imageio.get_writer(
-                f"val_videos_{args.hz}hz/{scene_idx if args.scene_idx is None else args.scene_idx[scene_idx]}/masks.mp4",
+                f"val_videos_{args.hz}hz_{args.height}x{args.width}/{scene_idx if args.scene_idx is None else args.scene_idx[scene_idx]}/masks.mp4",
                 mode="I",
                 fps=args.hz,
                 format="FFMPEG",
@@ -1861,19 +1875,19 @@ def main_worker(rank, world_size, args):
             for mask_path in mask_paths:
                 os.remove(mask_path)
             os.rmdir(
-                f"val_videos_{args.hz}hz/{scene_idx if args.scene_idx is None else args.scene_idx[scene_idx]}/rendered_masks"
+                f"val_videos_{args.hz}hz_{args.height}x{args.width}/{scene_idx if args.scene_idx is None else args.scene_idx[scene_idx]}/rendered_masks"
             )
             print(
-                f"✓ Mask video saved: val_videos_{args.hz}hz/{scene_idx if args.scene_idx is None else args.scene_idx[scene_idx]}/masks.mp4"
+                f"✓ Mask video saved: val_videos_{args.hz}hz_{args.height}x{args.width}/{scene_idx if args.scene_idx is None else args.scene_idx[scene_idx]}/masks.mp4"
             )
 
             # Report splat files if they were saved
             if args.save_splats:
                 splat_files = glob.glob(
-                    f"val_videos_{args.hz}hz/{scene_idx if args.scene_idx is None else args.scene_idx[scene_idx]}/splats/frame_*.pt"
+                    f"val_videos_{args.hz}hz_{args.height}x{args.width}/{scene_idx if args.scene_idx is None else args.scene_idx[scene_idx]}/splats/frame_*.pt"
                 )
                 print(
-                    f"✓ Splat files saved: {len(splat_files)} files in val_videos_{args.hz}hz/{scene_idx if args.scene_idx is None else args.scene_idx[scene_idx]}/splats/"
+                    f"✓ Splat files saved: {len(splat_files)} files in val_videos_{args.hz}hz_{args.height}x{args.width}/{scene_idx if args.scene_idx is None else args.scene_idx[scene_idx]}/splats/"
                 )
 
         # Synchronize all processes after video assembly
