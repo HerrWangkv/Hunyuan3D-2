@@ -1061,12 +1061,19 @@ def combine_background_and_human_splats(background_point_cloud_for_frame, human_
     return human_gs
 
 
-def render_gaussian(gaussian, extrinsics, intrinsics, width, height, mask_colors=None):
+def render_gaussian(gaussian, extrinsics, intrinsics, width, height, mask_colors=None, random_background=False):
     if gaussian is None:
-        return (
-            torch.ones(1, height, width, 3).cuda(),
-            torch.zeros(1, height, width, 1).bool().cuda(),
-        )
+        if random_background:
+            # Return pure random noise if there are no objects
+            return (
+                torch.rand(1, height, width, 3).cuda(),
+                torch.zeros(1, height, width, 1).bool().cuda(),
+            )
+        else:
+            return (
+                torch.ones(1, height, width, 3).cuda(),
+                torch.zeros(1, height, width, 1).bool().cuda(),
+            )
     extrinsics = torch.tensor(extrinsics).float().cuda()
     intrinsics = torch.tensor(intrinsics).float().cuda()
     intrinsics[0] *= width
@@ -1097,7 +1104,6 @@ def render_gaussian(gaussian, extrinsics, intrinsics, width, height, mask_colors
         radius_clip=0.0,
         backgrounds=torch.ones(1, 3).cuda(),
     )
-    renders = torch.clamp(renders, max=1.0)
     
     # Render mask with same scene but different colors
     # Humans = white (1.0), Bounding boxes = black (0.0), Background = black (0.0)
@@ -1126,13 +1132,19 @@ def render_gaussian(gaussian, extrinsics, intrinsics, width, height, mask_colors
         masks = (mask_renders[..., 0] > 0.5).unsqueeze(-1)  # Threshold at 0.5
     else:
         masks = (alphas > 0).bool()
-    
+
+    if random_background:
+        random_bg = torch.rand_like(renders)
+        mask_f = masks.float()
+        renders = renders * mask_f + random_bg * (1 - mask_f)
+
+    renders = torch.clamp(renders, max=1.0)
     return renders, masks
 
 
 def render(
     gs, intrinsics, extrinsics, width, height, save_path="render.png", mask_save_path="mask.png", 
-    background_point_clouds=None, frame_idx=None, human_only_gs=None
+    background_point_clouds=None, frame_idx=None, human_only_gs=None, random_background=False
 ):
     cams = CAMS
     images = []
@@ -1173,7 +1185,7 @@ def render(
                 mask_colors[num_bg:num_bg+num_humans, :] = 1.0
             if background_point_clouds is not None:
                 mask_colors[:num_bg, :] = 1.0
-        img, mask = render_gaussian(combined_gs, extrinsic, intrinsic, width, height, mask_colors=mask_colors)
+        img, mask = render_gaussian(combined_gs, extrinsic, intrinsic, width, height, mask_colors=mask_colors, random_background=random_background)
         img = img[0].detach().cpu().numpy()
         img = Image.fromarray((img * 255).astype(np.uint8))
         images.append(img)
@@ -1307,6 +1319,8 @@ def parse_args():
         default=848,
         help="Height of the rendered image."
     )
+    parser.add_argument("--random-background", action="store_true", help="Use pixelwise random noise for the background instead of white.")
+    parser.add_argument("--no-bboxes", action="store_true", help="Do not render bounding boxes to occlude smpl.")
     return parser.parse_args()
 
 
@@ -1779,7 +1793,10 @@ def main_worker(rank, world_size, args):
                 assert len(current_bbox_gs) == 0, "Bounding boxes should not be created when background video is provided"
                 all_gs = current_human_gs
             else:
-                all_gs = current_human_gs + current_bbox_gs
+                if args.no_bboxes:
+                    all_gs = current_human_gs
+                else:
+                    all_gs = current_human_gs + current_bbox_gs
             if all_gs:
                 gs = deepcopy(all_gs[0])
                 for obj_gs in all_gs[1:]:
@@ -1824,6 +1841,7 @@ def main_worker(rank, world_size, args):
                 background_point_clouds=background_point_clouds.get(t) if background_point_clouds else None,
                 frame_idx=t,
                 human_only_gs=human_only_gs,
+                random_background=args.random_background,
             )
 
         # Synchronize all processes after rendering
